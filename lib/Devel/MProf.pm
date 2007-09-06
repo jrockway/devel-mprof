@@ -3,75 +3,80 @@
 package Devel::MProf;
 use strict;
 use warnings;
-use Hook::LexWrap;
 
 our $VERSION = '0.00_00';
 
-my $deep = 0;
-*CORE::GLOBAL::caller = sub {
-    my ($height) = ($_[0]||0);
-    my $i=1;
-    my $name_cache;
-    while (1) {
-        my @caller = CORE::caller($i++) or return;
-        $caller[3] = $name_cache if $name_cache;
-        $name_cache = $caller[0] eq 'Hook::LexWrap' ? $caller[3] : '';
-        next if $name_cache || $height-- != 0;
-        return wantarray ? @_ ? @caller : @caller[0..2] : $caller[0];
-    }
-};
+package DB;
+my $sth;
+BEGIN { open OUT, '>', 'mprof.out' or die "failed to open mprof.out: $!" };
+END { close OUT }
+our $deep = 0;
 
-my $size = sub { 
+sub size {
     $deep = 1;
-    open my $m, '<', "/proc/$$/statm" or die "failed to open statm $!";
-    my $line = <$m>;
+
+    open M, '<', "/proc/$$/statm" or die "failed to open statm: $!";
+    my $line = join '', <M>;
     $line =~ /^(\d+)\s/; # <size> ...
+    close M;
+    
     $deep = 0;
     return $1;
 };
 
-sub DB::sub {
-    my @args = @_;
-    my $s = $DB::sub;
-
-    my $skip = 1; #($s =~ /(?:Exporter|MProf|vars)/);
-
-    if (!ref $s && !$deep && !$skip) {
-        no strict 'refs';
-        no warnings 'redefine';
-        
-        my $saved = *{$s}{CODE};
-        *{$s} = sub { 
-            my ($SR, @AR);
-            
-            print {*STDERR} "* my caller is ". join(':',caller). "\n";
-            
-            my $before = $size->();
-            
-            if (!defined wantarray) {
-                $saved->(@args);
-            }
-            elsif (wantarray) {
-                @AR = $saved->(@args);
-            }
-            else {
-                $SR = $saved->(@args);
-            }
-            
-            my $after = $size->();
-            
-            print {*STDERR} 
-              "** $s used ". ($after-$before). " kbytes ($before->$after)\n";
-            
-            return @AR if @AR;
-            return $SR if defined $SR;
-            return;
-        };
-    }
-    
-    goto &$s;
+sub record {
+    $deep = 1;
+    print OUT join ':',@_;
+    print OUT "\n";
+    $deep = 0;
 }
 
-sub DB::DB {};
+my $DEEP = 100;
+my @stack;
+
+sub sub {
+    no strict 'refs';
+    push(@stack, $DB::single);
+    $DB::single &= 1;
+    $DB::single |= 4 if $#stack == $DEEP;
+
+    my ($before,$after);
+    if (!$deep) {
+        $before = size();
+    }
+
+    my $void = $DB::sub eq 'DESTROY' || 
+      substr($DB::sub, -9) eq '::DESTROY' ||
+        not defined wantarray;
+
+    if ($void){
+        &$DB::sub;
+    }
+    elsif (wantarray) {
+        @DB::ret = &$DB::sub;
+    }
+    else {
+        $DB::ret = &$DB::sub;
+    }
+    $DB::single |= pop(@stack);
+
+    if (!$deep) {
+        $after = size();
+        record($DB::sub, $before, $after);
+    }
+    
+    if ($void) {
+        $DB::ret = undef;
+        return $DB::ret;
+    }
+    elsif (wantarray) {
+        return @DB::ret;
+    }
+    else {
+        return $DB::ret;
+    }
+}
+
+sub DB {};
 
 1;
